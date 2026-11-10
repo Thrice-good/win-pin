@@ -229,31 +229,15 @@ fn diag(msg: &str) {
 
 fn hwnd_of(frame: &eframe::Frame) -> Option<*mut core::ffi::c_void> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    if let Ok(handle) = frame.window_handle() {
-        if let RawWindowHandle::Win32(w) = handle.as_raw() {
-            return Some(w.hwnd.get() as *mut core::ffi::c_void);
-        }
+    let handle = frame.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(w) => Some(w.hwnd.get() as *mut core::ffi::c_void),
+        _ => None,
     }
-
-    // 兜底：单窗口程序，当前线程的活动窗口就是自己。
-    // 有了这条，即使 window_handle() 在某些时机返回 Err，
-    // 去边框和裁剪也不会被静默跳过。
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::UI::WindowsAndMessaging::GetActiveWindow;
-        let h = unsafe { GetActiveWindow() };
-        if !h.is_null() {
-            diag("hwnd: window_handle() 失败，已回退 GetActiveWindow");
-            return Some(h as *mut core::ffi::c_void);
-        }
-    }
-    diag("hwnd: 拿不到任何窗口句柄");
-    None
 }
 
 #[cfg(windows)]
-fn strip_border(frame: &eframe::Frame) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+fn strip_border(frame: &eframe::Frame) -> bool {
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
@@ -262,13 +246,10 @@ fn strip_border(frame: &eframe::Frame) {
         WS_SYSMENU, WS_THICKFRAME,
     };
 
-    let Ok(handle) = frame.window_handle() else {
-        return;
+    let Some(hwnd) = hwnd_of(frame) else {
+        diag("strip: 拿不到窗口句柄，下一帧再试");
+        return false;
     };
-    let RawWindowHandle::Win32(w) = handle.as_raw() else {
-        return;
-    };
-    let hwnd = w.hwnd.get() as _;
 
     const DWMWA_BORDER_COLOR: u32 = 34;
     const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
@@ -339,6 +320,8 @@ fn strip_border(frame: &eframe::Frame) {
         // 表现为顶部一根始终去不掉的线，在这里同样会出现。
         extend_frame_reset(hwnd);
     }
+
+    true
 }
 
 #[cfg(windows)]
@@ -373,24 +356,21 @@ unsafe fn extend_frame_reset(hwnd: *mut core::ffi::c_void) {
 }
 
 #[cfg(not(windows))]
-fn strip_border(_frame: &eframe::Frame) {}
+fn strip_border(_frame: &eframe::Frame) -> bool {
+    true
+}
 
 #[cfg(windows)]
 fn clip_circle(frame: &eframe::Frame, ppp: f32) -> bool {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{
         CreateEllipticRgn, CreateRectRgn, DeleteObject, GetWindowRgn, SetWindowRgn,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
 
-    let Ok(handle) = frame.window_handle() else {
+    let Some(hwnd) = hwnd_of(frame) else {
         return false;
     };
-    let RawWindowHandle::Win32(w) = handle.as_raw() else {
-        return false;
-    };
-    let hwnd = w.hwnd.get() as _;
 
     let mut rc: RECT = unsafe { std::mem::zeroed() };
     let got = unsafe { GetClientRect(hwnd, &mut rc) };
@@ -573,7 +553,7 @@ struct Pin {
     home: Option<Pos2>,
     pos_done: bool,
     border_fixed: bool,
-    region_tries: u8,
+    region_done: bool,
     /// 当前被置顶的窗口句柄（存成整数方便跨平台占位）
     pinned: Option<isize>,
     /// 拖动开始时的鼠标屏幕坐标，用来区分「单击」和「拖动」
@@ -593,7 +573,7 @@ impl Default for Pin {
             home: None,
             pos_done: false,
             border_fixed: false,
-            region_tries: 0,
+            region_done: false,
             pinned: None,
             drag_from: None,
             tilt: 0.0,
@@ -670,20 +650,17 @@ impl eframe::App for Pin {
             }
         }
 
-        // ---- 首帧：去描边 ----
-        if !self.border_fixed {
-            self.border_fixed = true;
-            strip_border(frame);
+        // ---- 首帧去描边：拿不到句柄就下一帧再试 ----
+        // 只试一次是不够的：窗口创建后头几帧 window_handle() 可能还返回空，
+        // 而样式一旦没改，整个程序就永久停在带边框的状态上。
+        if !self.border_fixed && self.warmup <= 90 {
+            self.border_fixed = strip_border(frame);
         }
 
-        // ---- 圆形裁剪：开头几帧连做几次 ----
-        // winit 创建窗口时可能重新应用样式把区域冲掉，所以做几帧再停。
-        if self.region_tries < 4 {
-            self.region_tries += 1;
-            clip_circle(frame, ctx.pixels_per_point());
-            if self.region_tries < 4 {
-                ctx.request_repaint();
-            }
+        // ---- 圆形裁剪：同样重试到成功 ----
+        // 预热阶段有 90 帧重绘，足够它把客户区尺寸读到、区域设进去。
+        if !self.region_done && self.warmup <= 90 {
+            self.region_done = clip_circle(frame, ctx.pixels_per_point());
         }
 
         // ---- 首次定位：上次的位置，没有就用右下角 ----
@@ -692,6 +669,13 @@ impl eframe::App for Pin {
             let p = load_pos().unwrap_or_else(|| home_pos(&ctx));
             self.home = Some(p);
             ctx.send_viewport_cmd(ViewportCommand::OuterPosition(p));
+        }
+
+        // 首帧发的定位命令可能因为窗口还没就绪而被丢掉，预热到第 5 帧补一次
+        if self.warmup == 5 {
+            if let Some(p) = self.home {
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(p));
+            }
         }
 
         // ---- 上一帧把图钉拖到了空白处，这一帧位置已同步，记成新家 ----
