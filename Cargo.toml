@@ -1,0 +1,39 @@
+[package]
+name = "win-pin"
+version = "0.1.0"
+edition = "2021"
+description = "低功耗窗口置顶图钉：把图钉拖到任意窗口上，那个窗口就置顶"
+
+[dependencies]
+# 与 focus-timer / sys-orb 相同的精简组合：glow 后端，不要 wgpu
+# default_fonts 保留是为了让 egui 的字体系统有基础字体，避免初始化异常；
+# 这个组件本身不画文字。
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+
+# 从 eframe::Frame 取原生窗口句柄
+raw-window-handle = "0.6"
+
+# 全部逻辑都用 Win32 原生 API：
+#   GetTopWindow/GetWindow  按 Z 序找鼠标下的窗口
+#   SetWindowPos            HWND_TOPMOST 置顶
+#   SetWindowRgn            把窗口裁成圆，圆角不拦截鼠标
+#   CreatePopupMenu         原生右键菜单（egui 的菜单会被 68px 窗口裁掉）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
+
+# 体积与功耗优先
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
