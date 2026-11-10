@@ -104,7 +104,9 @@ mod w32 {
     }
 
     pub fn alive(h: HWND) -> bool {
-        unsafe { IsWindow(h) } != 0
+        // 注意：写成 `unsafe { IsWindow(h) } != 0` 会编译不过 ——
+        // unsafe 块出现在语句位置时会被当成语句，后面的 != 就没有左操作数了。
+        unsafe { IsWindow(h) != 0 }
     }
 
     /// 屏幕坐标下的鼠标位置。
@@ -544,9 +546,7 @@ impl Default for Pin {
 impl Pin {
     fn unpin(&mut self) {
         if let Some(old) = self.pinned.take() {
-            unsafe {
-                w32::set_pinned(old as *mut core::ffi::c_void, false);
-            }
+            w32::set_pinned(old as *mut core::ffi::c_void, false);
         }
     }
 
@@ -554,20 +554,18 @@ impl Pin {
         let Some(me) = hwnd_of(frame) else {
             return false;
         };
-        let Some(target) = (unsafe { w32::under_cursor(me) }) else {
+        let Some(target) = w32::under_cursor(me) else {
             return false;
         };
 
         // 一次只钉一个：钉新的自动松开旧的，避免桌面上出现多个互不相让的置顶窗口
         if let Some(old) = self.pinned {
             if old != target as isize {
-                unsafe {
-                    w32::set_pinned(old as *mut core::ffi::c_void, false);
-                }
+                w32::set_pinned(old as *mut core::ffi::c_void, false);
             }
         }
 
-        if unsafe { w32::set_pinned(target, true) } {
+        if w32::set_pinned(target, true) {
             self.pinned = Some(target as isize);
         } else {
             return false;
@@ -575,7 +573,7 @@ impl Pin {
 
         // 目标窗口刚被提到最前，图钉会被它盖住（尤其是全屏或大窗口）。
         // 立刻把图钉自己重新提到最前，保证下一次还能点到。
-        unsafe { w32::set_pinned(me, true) };
+        w32::set_pinned(me, true);
         true
     }
 }
@@ -635,7 +633,7 @@ impl eframe::App for Pin {
         }
 
         if resp.drag_started() {
-            self.drag_from = unsafe { w32::cursor() };
+            self.drag_from = w32::cursor();
             // 交给系统做拖动：比自己在每帧发 OuterPosition 跟手得多
             ctx.send_viewport_cmd(ViewportCommand::StartDrag);
         }
@@ -643,7 +641,7 @@ impl eframe::App for Pin {
         if resp.drag_stopped() {
             // 用鼠标位移判断，而不是窗口位置：系统拖动结束后 egui 的
             // outer_rect 还停在旧值上，拿它判会把拖动误看成单击。
-            let moved = match (self.drag_from.take(), unsafe { w32::cursor() }) {
+            let moved = match (self.drag_from.take(), w32::cursor()) {
                 (Some(a), Some(b)) => {
                     let dx = (a.0 - b.0) as f32;
                     let dy = (a.1 - b.1) as f32;
@@ -671,7 +669,7 @@ impl eframe::App for Pin {
 
         if resp.secondary_clicked() {
             if let Some(h) = hwnd_of(frame) {
-                match unsafe { w32::popup_menu(h) } {
+                match w32::popup_menu(h) {
                     1 => {
                         self.unpin();
                         ctx.request_repaint();
@@ -686,7 +684,7 @@ impl eframe::App for Pin {
         if self.pinned.is_some() && now >= self.next_check {
             self.next_check = now + 1.0;
             if let Some(h) = self.pinned {
-                let gone = unsafe { !w32::alive(h as *mut core::ffi::c_void) };
+                let gone = !w32::alive(h as *mut core::ffi::c_void);
                 if gone {
                     self.pinned = None;
                 }
