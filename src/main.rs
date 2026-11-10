@@ -54,6 +54,10 @@ mod w32 {
         unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) }
     }
 
+    pub fn is_topmost(h: HWND) -> bool {
+        ex_style(h) & (WS_EX_TOPMOST as isize) != 0
+    }
+
     /// 从 Z 序最顶层往下扫，返回鼠标指针下第一个「可钉住」的窗口。
     ///
     /// 这里不用 WindowFromPoint：拖动时图钉就压在鼠标正下方，
@@ -103,6 +107,78 @@ mod w32 {
         }
     }
 
+    /// 只提 Z 序，不碰窗口级别。
+    ///
+    /// 目标窗口被置顶之后，图钉（也是 topmost）必须排在它前面才看得见；
+    /// 而两者都是 topmost 时，后一次 SetWindowPos 的会排到最前。
+    pub fn raise(h: HWND) {
+        unsafe {
+            SetWindowPos(
+                h,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// 窗口的屏幕矩形（物理像素）：(left, top, width, height)。
+    pub fn window_rect(h: HWND) -> Option<(i32, i32, i32, i32)> {
+        if unsafe { IsWindow(h) } == 0 {
+            return None;
+        }
+        let mut rc: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetWindowRect(h, &mut rc) } == 0 {
+            return None;
+        }
+        let w = rc.right - rc.left;
+        let hh = rc.bottom - rc.top;
+        if w <= 0 || hh <= 0 {
+            return None;
+        }
+        Some((rc.left, rc.top, w, hh))
+    }
+
+    pub fn minimized(h: HWND) -> bool {
+        unsafe { IsIconic(h) != 0 }
+    }
+
+    pub fn pid_of(h: HWND) -> u32 {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h, &mut pid) };
+        pid
+    }
+
+    /// 目标窗口属于哪个进程（只要文件名）。取不到就返回空串。
+    pub fn proc_name(h: HWND) -> String {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h, &mut pid) };
+        if pid == 0 {
+            return String::new();
+        }
+        let hp = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if hp.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(hp, 0, buf.as_mut_ptr(), &mut len) };
+        unsafe { CloseHandle(hp) };
+        if ok == 0 || len == 0 {
+            return String::new();
+        }
+        let full = String::from_utf16_lossy(&buf[..len as usize]);
+        full.rsplit('\\').next().unwrap_or("").to_string()
+    }
+
     pub fn alive(h: HWND) -> bool {
         // 注意：写成 `unsafe { IsWindow(h) } != 0` 会编译不过 ——
         // unsafe 块出现在语句位置时会被当成语句，后面的 != 就没有左操作数了。
@@ -127,10 +203,14 @@ mod w32 {
     /// 不用 egui 的 context_menu：egui 的菜单画在当前视口内部，
     /// 而图钉窗口只有 68px，菜单会被窗口边界整块裁掉。
     /// 返回 1 = 解除置顶，2 = 退出，0 = 取消。
-    pub fn popup_menu(hwnd: HWND) -> i32 {
+    ///
+    /// 第一项是只读的「已钉住 xxx.exe」：图钉贴在窗口角上时，
+    /// 光看图钉分不清它到底钉的是哪个程序，这一行同时承担状态回显。
+    pub fn popup_menu(hwnd: HWND, pinned_name: Option<&str>) -> i32 {
         let mut pt = POINT { x: 0, y: 0 };
         unsafe { GetCursorPos(&mut pt) };
 
+        let head = pinned_name.map(|n| wide(&format!("已钉住 {n}")));
         let unpin = wide("解除置顶");
         let quit = wide("退出");
 
@@ -138,6 +218,10 @@ mod w32 {
             let menu = CreatePopupMenu();
             if menu.is_null() {
                 return 0;
+            }
+            if let Some(h) = &head {
+                AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, h.as_ptr());
+                AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
             }
             AppendMenuW(menu, MF_STRING, 1, unpin.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
@@ -176,18 +260,125 @@ mod w32 {
     pub fn set_pinned(_h: *mut c_void, _on: bool) -> bool {
         false
     }
+    pub fn is_topmost(_h: *mut c_void) -> bool {
+        false
+    }
+    pub fn raise(_h: *mut c_void) {}
+    pub fn window_rect(_h: *mut c_void) -> Option<(i32, i32, i32, i32)> {
+        None
+    }
+    pub fn minimized(_h: *mut c_void) -> bool {
+        false
+    }
+    pub fn pid_of(_h: *mut c_void) -> u32 {
+        0
+    }
+    pub fn proc_name(_h: *mut c_void) -> String {
+        String::new()
+    }
     pub fn alive(_h: *mut c_void) -> bool {
         false
     }
     pub fn cursor() -> Option<(i32, i32)> {
         None
     }
-    pub fn popup_menu(_h: *mut c_void) -> i32 {
+    pub fn popup_menu(_h: *mut c_void, _pinned: Option<&str>) -> i32 {
         0
     }
     pub fn screen_size() -> (i32, i32) {
         (1920, 1080)
     }
+}
+
+// ============================================================
+// 跟随的事件源：SetWinEventHook
+//
+// 图钉贴在目标窗口上之后必须跟着它动。最直接的办法是定时轮询
+// GetWindowRect，但实测 60ms 一次会吃掉 3% CPU —— 对一个以省电为
+// 卖点的小工具来说不可接受，而 150ms 一次又会明显跟不上手。
+//
+// 改成事件驱动：系统在目标窗口位置变化时回调我们，静止时一次都
+// 不醒。代价是要把回调上下文放进 static（C 回调没法捕获环境）。
+//
+// 兜底：万一某些环境下 hook 收不到事件，主循环仍有低频轮询兜着，
+// 最坏退化成一秒跟上一次，不会彻底失效。
+// ============================================================
+
+#[cfg(windows)]
+mod follow {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::Mutex;
+
+    use eframe::egui;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EVENT_OBJECT_LOCATIONCHANGE, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    };
+
+    static TARGET: AtomicIsize = AtomicIsize::new(0);
+    static HOOK: AtomicIsize = AtomicIsize::new(0);
+    static CTX: Mutex<Option<egui::Context>> = Mutex::new(None);
+
+    unsafe extern "system" fn on_event(
+        _hook: HWINEVENTHOOK,
+        event: u32,
+        hwnd: HWND,
+        id_object: i32,
+        _id_child: i32,
+        _thread: u32,
+        _time: u32,
+    ) {
+        // 只要窗口本身的位置变化，不要菜单/控件内部的
+        if event != EVENT_OBJECT_LOCATIONCHANGE || id_object != OBJID_WINDOW {
+            return;
+        }
+        if hwnd as isize != TARGET.load(Ordering::Relaxed) {
+            return;
+        }
+        // 回调属于主线程（WINEVENT_OUTOFCONTEXT），这里只是设个重绘标志
+        if let Ok(guard) = CTX.lock() {
+            if let Some(ctx) = guard.as_ref() {
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// 开始盯住某个窗口。重复调用会先卸掉旧的 hook。
+    pub fn watch(ctx: &egui::Context, hwnd: *mut core::ffi::c_void, pid: u32) {
+        unwatch();
+        if let Ok(mut guard) = CTX.lock() {
+            *guard = Some(ctx.clone());
+        }
+        TARGET.store(hwnd as isize, Ordering::Relaxed);
+
+        let hook = unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                std::ptr::null_mut(),
+                Some(on_event),
+                pid,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        HOOK.store(hook as isize, Ordering::Relaxed);
+    }
+
+    pub fn unwatch() {
+        TARGET.store(0, Ordering::Relaxed);
+        let hook = HOOK.swap(0, Ordering::Relaxed) as HWINEVENTHOOK;
+        if !hook.is_null() {
+            unsafe { UnhookWinEvent(hook) };
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod follow {
+    pub fn watch(_ctx: &egui::Context, _hwnd: *mut core::ffi::c_void, _pid: u32) {}
+    pub fn unwatch() {}
 }
 
 // ============================================================
@@ -362,8 +553,20 @@ fn strip_border(_frame: &eframe::Frame) -> bool {
     true
 }
 
+/// 把窗口区域裁成「刚好裹住图钉」的窄椭圆。
+///
+/// 这个区域有两个作用：
+///
+/// 1. 去掉圆外那圈方形热区。窗口是 68×68，图钉本身只有 30×42，
+///    不裁的话图钉旁边全是会吃点击的隐形方块。
+/// 2. 顺带把 DWM 画在客户区第 0 行的那条 1px 边框线裁掉 ——
+///    那条线只在窗口区域是整矩形时才露出来。
+///
+/// 之所以不用整窗的圆：图钉现在是钉在目标窗口右上角的，整窗椭圆会
+/// 盖住标题栏的关闭按钮，用户就点不到叉了。收窄到图钉轮廓之后，
+/// 侵入窗口内部的部分只在针尖那 3px 高度上，宽度还从 15px 收到 0。
 #[cfg(windows)]
-fn clip_circle(frame: &eframe::Frame, ppp: f32) -> bool {
+fn clip_hotspot(frame: &eframe::Frame, ppp: f32) -> bool {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{
         CreateEllipticRgn, CreateRectRgn, DeleteObject, GetWindowRgn, SetWindowRgn,
@@ -384,7 +587,22 @@ fn clip_circle(frame: &eframe::Frame, ppp: f32) -> bool {
         ch = cw;
     }
 
-    let rgn = unsafe { CreateEllipticRgn(0, 0, cw, ch) };
+    // 图钉图形在局部坐标里是 x∈[-11,11]、y∈[-18,17]；钉住时会左倾 0.2rad，
+    // 包围盒略微变大，所以留到 15×21 才够裹住。
+    let scale = ch as f32 / PANE;
+    let rx = 15.0 * scale;
+    let ry = 21.0 * scale;
+    let cx = cw as f32 * 0.5;
+    let cy = ch as f32 * 0.5 - scale;
+
+    let rgn = unsafe {
+        CreateEllipticRgn(
+            (cx - rx).round() as i32,
+            (cy - ry).round() as i32,
+            (cx + rx).round() as i32,
+            (cy + ry).round() as i32,
+        )
+    };
     if rgn.is_null() {
         return false;
     }
@@ -407,7 +625,7 @@ fn clip_circle(frame: &eframe::Frame, ppp: f32) -> bool {
 }
 
 #[cfg(not(windows))]
-fn clip_circle(_frame: &eframe::Frame, _ppp: f32) -> bool {
+fn clip_hotspot(_frame: &eframe::Frame, _ppp: f32) -> bool {
     true
 }
 
@@ -437,14 +655,17 @@ fn ellipse_pts(c: Vec2, rx: f32, ry: f32, n: usize) -> Vec<Vec2> {
         .collect()
 }
 
-/// tilt 0 = 未钉（直立灰蓝），1 = 已钉（左倾红色）
+/// tilt 0 = 未钉（直立灰蓝），1 = 已钉（微微左倾的红色）
+///
+/// 钉住时倾角刻意做得很小：图钉现在是扎在目标窗口的上沿上，
+/// 倾得太厉害会显得是「歪在外面」，而不是「钉进去了」。
 fn paint_pin(ui: &egui::Ui, tilt: f32, hover: f32) {
     let p = ui.painter();
-    let center = ui.max_rect().center() + Vec2::new(0.0, -3.0 * tilt);
+    let center = ui.max_rect().center() + Vec2::new(0.0, -2.0 * tilt);
 
     let base = if tilt > 0.5 { C_PINNED } else { C_IDLE };
     let base = shade(base, 1.0 + 0.16 * hover);
-    let ang = -0.58 * tilt;
+    let ang = -0.20 * tilt;
 
     // 局部坐标 → 屏幕坐标
     let tf = |v: Vec2| center + rot(v, ang);
@@ -534,16 +755,20 @@ fn save_pos(p: Pos2) {
 // ============================================================
 
 fn home_pos(ctx: &egui::Context) -> Pos2 {
+    let sz = screen_size_pt(ctx);
+    Pos2::new(sz.x - PANE - MARGIN, sz.y - PANE - MARGIN)
+}
+
+fn screen_size_pt(ctx: &egui::Context) -> Vec2 {
     let from_viewport = ctx.input(|i| i.viewport().monitor_size);
-    let sz = match from_viewport {
+    match from_viewport {
         Some(m) if m.x > 200.0 && m.y > 200.0 => m,
         _ => {
             let (w, h) = w32::screen_size();
-            let ppp = ctx.pixels_per_point();
+            let ppp = ctx.pixels_per_point().max(0.1);
             Vec2::new(w as f32 / ppp, h as f32 / ppp)
         }
-    };
-    Pos2::new(sz.x - PANE - MARGIN, sz.y - PANE - MARGIN)
+    }
 }
 
 // ============================================================
@@ -554,14 +779,18 @@ struct Pin {
     home: Option<Pos2>,
     pos_done: bool,
     border_fixed: bool,
-    region_done: bool,
     /// 当前被置顶的窗口句柄（存成整数方便跨平台占位）
     pinned: Option<isize>,
     /// 拖动开始时的鼠标屏幕坐标，用来区分「单击」和「拖动」
     drag_from: Option<(i32, i32)>,
+    /// 被钉窗口上一次的屏幕矩形（物理像素）。用来判断它有没有动。
+    last_rect: Option<(i32, i32, i32, i32)>,
+    /// 系统拖动进行中：这时候位置由鼠标决定，绝不能再发定位命令
+    dragging: bool,
     tilt: f32,
     hover: f32,
-    next_check: f64,
+    /// 被钉窗口的进程名，只在钉住时用来做菜单回显
+    target_name: String,
     /// 拖动落到空白处后，等下一帧（位置已同步）再把新位置记为家
     capture_home: bool,
     /// 启动预热帧计数：见 ui() 里的说明
@@ -574,26 +803,99 @@ impl Default for Pin {
             home: None,
             pos_done: false,
             border_fixed: false,
-            region_done: false,
             pinned: None,
             drag_from: None,
+            last_rect: None,
+            dragging: false,
             tilt: 0.0,
             hover: 0.0,
-            next_check: 0.0,
+            target_name: String::new(),
             capture_home: false,
             warmup: 0,
         }
     }
 }
 
+/// 图钉骑在目标窗口右上角时自己的位置（points）。
+///
+/// 针尖在局部坐标里是 y=+17，窗口中心在 `pos + PANE/2`。
+/// 要让针尖正好落在窗口上沿，窗口中心就得在 top-17，于是
+/// 窗口左上角在 top-51。水平方向让图钉中心几乎压在窗口右边缘上
+/// （只往里收 2px），这样既看得出是「夹在角上」，又只压住标题栏
+/// 最右端十来像素，不会盖住关闭按钮。
+fn pin_pos_for_window(ctx: &egui::Context, rc: (i32, i32, i32, i32)) -> Pos2 {
+    let ppp = ctx.pixels_per_point().max(0.1);
+    let (left, top, w, _h) = rc;
+    let right_pt = (left + w) as f32 / ppp;
+    let top_pt = top as f32 / ppp;
+    let sz = screen_size_pt(ctx);
+
+    let clamp = |p: Pos2| {
+        Pos2::new(
+            p.x.clamp(0.0, (sz.x - PANE).max(0.0)),
+            p.y.clamp(0.0, (sz.y - PANE).max(0.0)),
+        )
+    };
+
+    // 首选：坐在窗口上沿右侧，针尖扎进上沿
+    if top_pt >= 51.0 {
+        return clamp(Pos2::new(right_pt - 32.0, top_pt - 51.0));
+    }
+
+    // 窗口贴着屏幕上沿（最大化就是这种）：上面没地方放，硬塞会被屏幕裁掉
+    // 半个图钉。改挂到窗口右侧外面，至少完整可见、也不遮窗口内容。
+    let side = Pos2::new(right_pt + 2.0, top_pt + 4.0);
+    if side.x + PANE <= sz.x {
+        return clamp(side);
+    }
+
+    // 右侧也顶到屏幕边了：只能压回窗口里，优先保住「在右上角」这个位置感
+    clamp(Pos2::new(right_pt - 32.0, top_pt + 4.0))
+}
+
 impl Pin {
-    fn unpin(&mut self) {
+    fn target(&self) -> Option<*mut core::ffi::c_void> {
+        self.pinned.map(|h| h as *mut core::ffi::c_void)
+    }
+
+    /// 只松开：取消目标窗口的置顶并清掉跟踪状态，图钉原地不动。
+    ///
+    /// 和 unpin 分开是因为「拖到空白处换个家」这个动作要求图钉留在松手的
+    /// 位置，如果顺手飞回窝，紧接着记下的新家就变成旧窝了。
+    fn release(&mut self) {
         if let Some(old) = self.pinned.take() {
             w32::set_pinned(old as *mut core::ffi::c_void, false);
         }
+        follow::unwatch();
+        self.last_rect = None;
+        self.target_name.clear();
     }
 
-    fn pin_at_cursor(&mut self, frame: &eframe::Frame) -> bool {
+    /// 松开，并把图钉送回它的窝。单击、右键菜单、目标窗口关闭都走这条。
+    fn unpin(&mut self, ctx: &egui::Context) {
+        self.release();
+        self.fly_home(ctx);
+    }
+
+    fn fly_home(&mut self, ctx: &egui::Context) {
+        if let Some(h) = self.home {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(h));
+        }
+    }
+
+    /// 把图钉贴到目标窗口的右上角，并记下这一帧的位置基准。
+    fn snap_to_target(&mut self, ctx: &egui::Context) {
+        let Some(h) = self.target() else {
+            return;
+        };
+        let Some(rc) = w32::window_rect(h) else {
+            return;
+        };
+        self.last_rect = Some(rc);
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pin_pos_for_window(ctx, rc)));
+    }
+
+    fn pin_at_cursor(&mut self, frame: &eframe::Frame, ctx: &egui::Context) -> bool {
         let Some(me) = hwnd_of(frame) else {
             return false;
         };
@@ -610,13 +912,71 @@ impl Pin {
 
         if w32::set_pinned(target, true) {
             self.pinned = Some(target as isize);
+            self.target_name = w32::proc_name(target);
+            // 让系统在目标窗口移动时回调（而不是自己定时轮询）
+            follow::watch(ctx, target, w32::pid_of(target));
         } else {
             return false;
         }
 
         // 目标窗口刚被提到最前，图钉会被它盖住（尤其是全屏或大窗口）。
         // 立刻把图钉自己重新提到最前，保证下一次还能点到。
-        w32::set_pinned(me, true);
+        w32::raise(me);
+        true
+    }
+
+    /// 每帧维护「图钉贴在窗口角上」这件事：目标窗口动了就跟着动。
+    ///
+    /// 返回 true 表示这一帧处于跟随态（还在盯着某个窗口），
+    /// 调用方据此决定轮询节拍：只有跟随态才需要高频醒来。
+    fn follow_target(&mut self, ctx: &egui::Context, frame: &eframe::Frame) -> bool {
+        let Some(h) = self.target() else {
+            return false;
+        };
+
+        if !w32::alive(h) {
+            // 窗口被关掉了：松开，图钉飞回窝。这是最自然的收尾。
+            self.unpin(ctx);
+            return false;
+        }
+
+        // 最小化时没有「角」可钉：图钉回窝待着，但保持已钉状态，
+        // 等窗口恢复再自己贴回去。
+        if w32::minimized(h) {
+            if self.last_rect.take().is_some() {
+                self.fly_home(ctx);
+            }
+            return true;
+        }
+
+        // 用户正拖着图钉：位置归鼠标管，这时插一脚会让它抖
+        if self.dragging {
+            return true;
+        }
+
+        let Some(rc) = w32::window_rect(h) else {
+            return true;
+        };
+
+        // 目标窗口会自己把置顶改回去 —— 实测 .NET / WinForms 的窗口在
+        // 被激活时就会丢掉 WS_EX_TOPMOST（Z 序仍在前面，但不再钉住）。
+        // 所以不能"设一次就信它"，每次兜底检查时都确认一遍。
+        if !w32::is_topmost(h) {
+            w32::set_pinned(h, true);
+        }
+
+        if Some(rc) != self.last_rect {
+            self.last_rect = Some(rc);
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pin_pos_for_window(ctx, rc)));
+            ctx.request_repaint();
+        }
+
+        // 图钉必须一直压在目标窗口上面：两者都是 topmost，目标窗口被激活时
+        // 会排到前面去。这里每次兜底检查都把自己提回最前，代价是一次
+        // 不带移动/缩放的 SetWindowPos，几乎为零。
+        if let Some(me) = hwnd_of(frame) {
+            w32::raise(me);
+        }
         true
     }
 }
@@ -628,7 +988,6 @@ impl eframe::App for Pin {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let now = ctx.input(|i| i.time);
 
         // ---- 启动预热：前 90 帧强制重绘 ----
         // 窗口刚创建时 GL surface 往往还没就绪，首帧画的内容会整个丢掉。
@@ -692,20 +1051,17 @@ impl eframe::App for Pin {
         // 画出一条 1px 深灰边框线 —— 就是那条"怎么都去不掉"的线。
         // 实测把一个只有左上 20x20 的矩形设成窗口区域，那条线立刻被裁掉，
         // 说明裁剪本身有效，问题在于它会被重置、而本组件静止时不重绘，
-        // 于是再也没有机会补上。改成低频巡检，发现不是椭圆就重设。
+        // 于是再也没有机会补上。
+        //
+        // 现在图钉会跟着目标窗口一起移动，每次移动都可能把区域冲掉，
+        // 所以这里必须无条件、每帧重设：不能靠"读回来判断是否已经裁过"——
+        // 实测 GetWindowRgn 对被重置的矩形也报 COMPLEXREGION，判不出来。
         #[cfg(windows)]
         {
             if hwnd_of(frame).is_some() {
-                // 这里必须无条件重设，不能靠"读回来判断是否已经裁过"：
-                // 实测 GetWindowRgn 对被 winit 重置的矩形也报 COMPLEXREGION，
-                // 两种状态的返回值完全一样，判断不出来。而 SetWindowRgn 只是
-                // 一次很轻的 GDI 调用，2 秒一次的开销可以忽略。
-                self.region_done = clip_circle(frame, ctx.pixels_per_point());
+                clip_hotspot(frame, ctx.pixels_per_point());
             }
         }
-
-        // 巡检节拍：2 秒一帧，开销可忽略（一次静态重绘），但换来区域不会丢
-        ctx.request_repaint_after(Duration::from_secs(2));
 
         // ---- 上一帧把图钉拖到了空白处，这一帧位置已同步，记成新家 ----
         // 预热期间不接受：避免启动瞬间的误判把默认位置写坏。
@@ -731,11 +1087,14 @@ impl eframe::App for Pin {
 
         if resp.drag_started() {
             self.drag_from = w32::cursor();
+            self.dragging = true;
             // 交给系统做拖动：比自己在每帧发 OuterPosition 跟手得多
             ctx.send_viewport_cmd(ViewportCommand::StartDrag);
         }
 
         if resp.drag_stopped() {
+            self.dragging = false;
+
             // 用鼠标位移判断，而不是窗口位置：系统拖动结束后 egui 的
             // outer_rect 还停在旧值上，拿它判会把拖动误看成单击。
             let moved = match (self.drag_from.take(), w32::cursor()) {
@@ -748,27 +1107,45 @@ impl eframe::App for Pin {
             };
 
             if moved {
-                if self.pin_at_cursor(frame) {
-                    // 钉住了：图钉弹回原位，让「拖动」只表示「钉窗口」这一个意思
-                    if let Some(h) = self.home {
-                        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(h));
-                    }
+                if self.pin_at_cursor(frame, &ctx) {
+                    // 钉住了：图钉立刻贴到那个窗口的右上角，之后跟着窗口走。
+                    // 这是整套交互的核心 —— 钉在哪里，就留在哪里。
+                    self.snap_to_target(&ctx);
+                } else if self.pinned.is_some() {
+                    // 本来钉着某个窗口，这次拖到了空白处 → 解钉 + 换家
+                    self.release();
+                    self.capture_home = true;
                 } else {
-                    // 落在空白处：没钉到任何窗口，那就把当前位置当成新的家。
-                    // 这样「把图钉挪到顺手的地方」也顺带有了，不用额外做菜单项。
+                    // 落在空白处：把当前位置当成新的家。
+                    // 「把图钉挪到顺手的地方」也顺带有了，不用额外做菜单项。
                     self.capture_home = true;
                 }
             } else {
-                self.unpin();
+                // 单击：解钉，图钉飞回窝
+                self.unpin(&ctx);
             }
+            ctx.request_repaint();
+        }
+
+        // 纯单击（没有拖动）：解钉，图钉飞回窝。
+        // 不能只靠 drag_started/drag_stopped —— egui 的 drag 要位移超过阈值
+        // 才成立，手不抖的一下点击根本不会产生 drag，只会产生 clicked。
+        // 之前只写在 drag_stopped 里，结果单击完全没反应。
+        if resp.clicked() {
+            self.unpin(&ctx);
             ctx.request_repaint();
         }
 
         if resp.secondary_clicked() {
             if let Some(h) = hwnd_of(frame) {
-                match w32::popup_menu(h) {
+                let name = if self.pinned.is_some() {
+                    Some(self.target_name.as_str())
+                } else {
+                    None
+                };
+                match w32::popup_menu(h, name) {
                     1 => {
-                        self.unpin();
+                        self.unpin(&ctx);
                         ctx.request_repaint();
                     }
                     2 => ctx.send_viewport_cmd(ViewportCommand::Close),
@@ -777,20 +1154,18 @@ impl eframe::App for Pin {
             }
         }
 
-        // ---- 被钉的窗口关掉了就自动松开 ----
-        if self.pinned.is_some() && now >= self.next_check {
-            self.next_check = now + 1.0;
-            if let Some(h) = self.pinned {
-                let gone = !w32::alive(h as *mut core::ffi::c_void);
-                if gone {
-                    self.pinned = None;
-                }
-            }
-        }
-        if self.pinned.is_some() {
-            let wait = (self.next_check - now).max(0.2) as f32;
-            ctx.request_repaint_after(Duration::from_secs_f32(wait));
-        }
+        // ---- 跟随：目标窗口移动 / 缩放 / 最小化 / 关闭 ----
+        let following = self.follow_target(&ctx, frame);
+
+        // 目标窗口一动，系统会通过 WinEventHook 把我们叫醒，所以这里的
+        // 定时器只是兜底（防某些环境下收不到事件），一秒一次足够。
+        // 不跟随时回到 2 秒，常驻开销归零。
+        let wait = if following {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(2)
+        };
+        ctx.request_repaint_after(wait);
 
         // ---- 倾斜动画 ----
         let target_tilt = if self.pinned.is_some() { 1.0 } else { 0.0 };
