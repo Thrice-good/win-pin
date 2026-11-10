@@ -11,6 +11,9 @@ description = "低功耗窗口置顶图钉：把图钉拖到任意窗口上，�
 eframe = { version = "0.37", default-features = false, features = [
     "glow",
     "default_fonts",
+    # 与 sys-orb 保持一致：缺这一项时 egui 只能退到内置字体集，
+    # 在部分机器上会让渲染管线初始化表现异常（画不出东西）。
+    "system_fonts",
 ] }
 
 # 从 eframe::Frame 取原生窗口句柄
