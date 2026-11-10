@@ -197,13 +197,58 @@ mod w32 {
 // 透明区域不拦截鼠标 —— 否则图钉旁边一圈方形热区会挡住桌面。
 // ============================================================
 
+// ============================================================
+// 启动诊断
+//
+// 打不开画面的问题，如果只看现象只能靠猜；把关键事实落到文件里，
+// 一眼就能看出是「没拿到窗口句柄」还是「拿到了但样式没改掉」。
+// ============================================================
+
+fn diag_path() -> std::path::PathBuf {
+    match std::env::var("APPDATA") {
+        Ok(p) => std::path::PathBuf::from(p).join("win-pin").join("boot.txt"),
+        Err(_) => std::path::PathBuf::from("win-pin-boot.txt"),
+    }
+}
+
+fn diag_reset() {
+    let p = diag_path();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&p, "");
+}
+
+fn diag(msg: &str) {
+    use std::io::Write;
+    let p = diag_path();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
 fn hwnd_of(frame: &eframe::Frame) -> Option<*mut core::ffi::c_void> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let handle = frame.window_handle().ok()?;
-    match handle.as_raw() {
-        RawWindowHandle::Win32(w) => Some(w.hwnd.get() as *mut core::ffi::c_void),
-        _ => None,
+    if let Ok(handle) = frame.window_handle() {
+        if let RawWindowHandle::Win32(w) = handle.as_raw() {
+            return Some(w.hwnd.get() as *mut core::ffi::c_void);
+        }
     }
+
+    // 兜底：单窗口程序，当前线程的活动窗口就是自己。
+    // 有了这条，即使 window_handle() 在某些时机返回 Err，
+    // 去边框和裁剪也不会被静默跳过。
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetActiveWindow;
+        let h = unsafe { GetActiveWindow() };
+        if !h.is_null() {
+            diag("hwnd: window_handle() 失败，已回退 GetActiveWindow");
+            return Some(h as *mut core::ffi::c_void);
+        }
+    }
+    diag("hwnd: 拿不到任何窗口句柄");
+    None
 }
 
 #[cfg(windows)]
@@ -279,6 +324,15 @@ fn strip_border(frame: &eframe::Frame) {
             0,
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
+
+        let after = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        diag(&format!(
+            "strip: hwnd=0x{:X} style 0x{:08X} -> 0x{:08X} (caption_now={})",
+            hwnd as usize,
+            style as u32,
+            after as u32,
+            (after & (WS_CAPTION as isize)) != 0
+        ));
 
         // 撤掉 winit 给透明窗口设的「玻璃框架」扩展。
         // 这个扩展会让 DWM 在客户区顶部画一条 1px 框架线 —— 在 sys-orb 上
@@ -362,6 +416,11 @@ fn clip_circle(frame: &eframe::Frame, ppp: f32) -> bool {
     let probe = unsafe { CreateRectRgn(0, 0, 1, 1) };
     let kind = unsafe { GetWindowRgn(hwnd, probe) };
     unsafe { DeleteObject(probe) };
+
+    diag(&format!(
+        "region: client={}x{} kind={} (0=err 1=null 2=simple 3=complex)",
+        cw, ch, kind
+    ));
 
     kind >= 1
 }
@@ -524,6 +583,8 @@ struct Pin {
     next_check: f64,
     /// 拖动落到空白处后，等下一帧（位置已同步）再把新位置记为家
     capture_home: bool,
+    /// 启动预热帧计数：见 ui() 里的说明
+    warmup: u8,
 }
 
 impl Default for Pin {
@@ -539,6 +600,7 @@ impl Default for Pin {
             hover: 0.0,
             next_check: 0.0,
             capture_home: false,
+            warmup: 0,
         }
     }
 }
@@ -587,6 +649,27 @@ impl eframe::App for Pin {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
 
+        // ---- 启动预热：前 90 帧强制重绘 ----
+        // 窗口刚创建时 GL surface 往往还没就绪，首帧画的内容会整个丢掉。
+        // 本组件静止时不请求重绘，于是首帧一丢就永久停在系统白底上。
+        // sys-orb 每 2 秒采样一次、顺带重绘，所以从没暴露这个问题。
+        if self.warmup < 90 {
+            self.warmup += 1;
+            ctx.request_repaint();
+            if self.warmup == 1 || self.warmup == 45 || self.warmup == 90 {
+                let r = ui.max_rect();
+                diag(&format!(
+                    "frame {}: max_rect=({:.0},{:.0},{:.0},{:.0}) ppp={:.2}",
+                    self.warmup,
+                    r.min.x,
+                    r.min.y,
+                    r.max.x,
+                    r.max.y,
+                    ctx.pixels_per_point()
+                ));
+            }
+        }
+
         // ---- 首帧：去描边 ----
         if !self.border_fixed {
             self.border_fixed = true;
@@ -612,7 +695,8 @@ impl eframe::App for Pin {
         }
 
         // ---- 上一帧把图钉拖到了空白处，这一帧位置已同步，记成新家 ----
-        if self.capture_home {
+        // 预热期间不接受：避免启动瞬间的误判把默认位置写坏。
+        if self.capture_home && self.warmup >= 90 {
             self.capture_home = false;
             if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
                 self.home = Some(r.min);
@@ -709,6 +793,8 @@ impl eframe::App for Pin {
 }
 
 fn main() -> eframe::Result<()> {
+    diag_reset();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([PANE, PANE])
