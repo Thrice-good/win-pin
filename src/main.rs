@@ -286,38 +286,40 @@ fn strip_border(frame: &eframe::Frame) -> bool {
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
         let style_mask =
             (WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_SYSMENU) as isize;
-        if style & style_mask != 0 {
+        let had_style = style & style_mask != 0;
+        if had_style {
             SetWindowLongPtrW(hwnd, GWL_STYLE, style & !style_mask);
         }
 
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let ex_mask = (WS_EX_CLIENTEDGE | WS_EX_WINDOWEDGE | WS_EX_DLGMODALFRAME) as isize;
-        if ex & ex_mask != 0 {
+        let had_ex = ex & ex_mask != 0;
+        if had_ex {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !ex_mask);
         }
 
-        SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            0,
-            0,
-            0,
-            0,
-            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
+        // 只有真改过样式才让 DWM 重算框架；无条件调用会每帧闪一次
+        if had_style || had_ex {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            diag(&format!(
+                "strip: style 0x{:08X} -> 0x{:08X}",
+                style as u32,
+                GetWindowLongPtrW(hwnd, GWL_STYLE) as u32
+            ));
+        }
 
-        let after = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        diag(&format!(
-            "strip: hwnd=0x{:X} style 0x{:08X} -> 0x{:08X} (caption_now={})",
-            hwnd as usize,
-            style as u32,
-            after as u32,
-            (after & (WS_CAPTION as isize)) != 0
-        ));
-
-        // 撤掉 winit 给透明窗口设的「玻璃框架」扩展。
-        // 这个扩展会让 DWM 在客户区顶部画一条 1px 框架线 —— 在 sys-orb 上
-        // 表现为顶部一根始终去不掉的线，在这里同样会出现。
+        // 撤掉 winit 给透明窗口设的「玻璃框架」扩展 —— 它会让 DWM 在客户区
+        // 顶端画一条 1px 线（sys-orb 上也出现过同样的一条）。
+        // 关键在于：winit 在窗口真正显示之后会再打开一次，所以这行必须
+        // 反复执行，只在首帧做一次是压不住的。
         extend_frame_reset(hwnd);
     }
 
@@ -397,10 +399,9 @@ fn clip_circle(frame: &eframe::Frame, ppp: f32) -> bool {
     let kind = unsafe { GetWindowRgn(hwnd, probe) };
     unsafe { DeleteObject(probe) };
 
-    diag(&format!(
-        "region: client={}x{} kind={} (0=err 1=null 2=simple 3=complex)",
-        cw, ch, kind
-    ));
+    if kind < 1 {
+        diag(&format!("region: 设置失败 client={}x{} kind={}", cw, ch, kind));
+    }
 
     kind >= 1
 }
@@ -650,17 +651,25 @@ impl eframe::App for Pin {
             }
         }
 
-        // ---- 首帧去描边：拿不到句柄就下一帧再试 ----
-        // 只试一次是不够的：窗口创建后头几帧 window_handle() 可能还返回空，
-        // 而样式一旦没改，整个程序就永久停在带边框的状态上。
-        if !self.border_fixed && self.warmup <= 90 {
+        // ---- 去描边：只做一次 ----
+        // 千万不要每帧重做：清完样式必须 SetWindowPos(SWP_FRAMECHANGED) 让
+        // DWM 重算框架，而这个调用每帧来一次会把 GL 画面反复刷掉 —— 实测
+        // 表现就是整个窗口退回系统白底。
+        if self.warmup == 1 {
             self.border_fixed = strip_border(frame);
         }
 
-        // ---- 圆形裁剪：同样重试到成功 ----
-        // 预热阶段有 90 帧重绘，足够它把客户区尺寸读到、区域设进去。
-        if !self.region_done && self.warmup <= 90 {
-            self.region_done = clip_circle(frame, ctx.pixels_per_point());
+        // ---- 窗口真正显示后，再撤一次玻璃框架 ----
+        // winit 在窗口可见之后会把透明窗口的框架扩展重新打开，DWM 于是又在
+        // 客户区顶端画一条 1px 中性灰的线（和 sys-orb 当初那条一模一样）。
+        // 这里只在几个时间点补刀，且只动 DWM 属性、不动窗口样式，不触发重排。
+        if matches!(self.warmup, 3 | 8 | 20 | 45 | 90) {
+            #[cfg(windows)]
+            {
+                if let Some(h) = hwnd_of(frame) {
+                    unsafe { extend_frame_reset(h) };
+                }
+            }
         }
 
         // ---- 首次定位：上次的位置，没有就用右下角 ----
@@ -677,6 +686,26 @@ impl eframe::App for Pin {
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(p));
             }
         }
+
+        // ---- 圆形裁剪：必须放在定位之后，而且要持续巡检 ----
+        // 移动窗口会让 winit 把窗口区域重置回矩形，DWM 随即在客户区第 0 行
+        // 画出一条 1px 深灰边框线 —— 就是那条"怎么都去不掉"的线。
+        // 实测把一个只有左上 20x20 的矩形设成窗口区域，那条线立刻被裁掉，
+        // 说明裁剪本身有效，问题在于它会被重置、而本组件静止时不重绘，
+        // 于是再也没有机会补上。改成低频巡检，发现不是椭圆就重设。
+        #[cfg(windows)]
+        {
+            if hwnd_of(frame).is_some() {
+                // 这里必须无条件重设，不能靠"读回来判断是否已经裁过"：
+                // 实测 GetWindowRgn 对被 winit 重置的矩形也报 COMPLEXREGION，
+                // 两种状态的返回值完全一样，判断不出来。而 SetWindowRgn 只是
+                // 一次很轻的 GDI 调用，2 秒一次的开销可以忽略。
+                self.region_done = clip_circle(frame, ctx.pixels_per_point());
+            }
+        }
+
+        // 巡检节拍：2 秒一帧，开销可忽略（一次静态重绘），但换来区域不会丢
+        ctx.request_repaint_after(Duration::from_secs(2));
 
         // ---- 上一帧把图钉拖到了空白处，这一帧位置已同步，记成新家 ----
         // 预热期间不接受：避免启动瞬间的误判把默认位置写坏。
