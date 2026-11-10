@@ -1,0 +1,42 @@
+name: build-windows-exe
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # 静态链接 C 运行库：产物是单个 exe，目标机器不需要装 VC++ 运行库
+      RUSTFLAGS: -C target-feature=+crt-static
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 编译 release
+        run: cargo build --release
+
+      - name: 打印产物大小
+        run: |
+          $exe = Get-Item target/release/win-pin.exe
+          "产物: $($exe.Name)  大小: $([math]::Round($exe.Length / 1MB, 2)) MB"
+
+      - name: 上传可执行文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-pin-windows-x64
+          path: target/release/win-pin.exe
+          if-no-files-found: error
+          retention-days: 90
